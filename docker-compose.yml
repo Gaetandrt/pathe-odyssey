@@ -1,0 +1,19 @@
+services:
+  imax-watcher:
+    build: .
+    container_name: pathe-imax-watcher
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      STATE_FILE: /data/state.json
+      LOOP: "1"
+      CHECK_INTERVAL_SECONDS: ${CHECK_INTERVAL_SECONDS:-300}
+      COOLDOWN_SECONDS: ${COOLDOWN_SECONDS:-1800}
+      ERROR_COOLDOWN_SECONDS: ${ERROR_COOLDOWN_SECONDS:-3600}
+      NTFY_SERVER: ${NTFY_SERVER:-https://ntfy.sh}
+    volumes:
+      - watcher-data:/data
+
+volumes:
+  watcher-data:
