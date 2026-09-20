@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 Surveillance IMAX 70mm - L'Odyssée @ Pathé Odysseum
-Envoie une push iPhone via ntfy.sh dès qu'une nouvelle date
-ou des places disponibles apparaissent.
+Push iPhone via ntfy.sh
 """
 
 from __future__ import annotations
@@ -13,39 +12,61 @@ import logging
 import os
 import re
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import requests
+from bs4 import BeautifulSoup
 
 # ──────────────────────────────────────────────
-# CONFIG — à adapter
+# CONFIG
 # ──────────────────────────────────────────────
 NTFY_TOPIC = os.getenv("NTFY_TOPIC", "pathe-odysseum-imax-CHANGE_MOI")
 NTFY_SERVER = os.getenv("NTFY_SERVER", "https://ntfy.sh")
 
-# Pathé Odysseum + L'Odyssée — projection IMAX 70mm (show dédié)
 CINEMA_SLUG = "cinema-pathe-odysseum"
-FILM_SLUG = "l-odyssee-projection-imax-70mm-54413"
-FILM_ID = "54413"
-BOOKING_URL = f"https://www.pathe.fr/films/{FILM_SLUG}?cinema={CINEMA_SLUG}"
-SHOWTIMES_URL = (
-    f"https://www.pathe.fr/api/show/{FILM_SLUG}/showtimes/{CINEMA_SLUG}"
+
+# Événement IMAX 70mm (correct) + film classique (fallback)
+EVENT_SLUG = "l-odyssee-projection-imax-70mm-54413"
+EVENT_ID = "54413"
+FILM_SLUG = "l-odyssee-43836"
+FILM_ID = "43836"
+
+# Endpoints API — ordre de priorité (event d'abord)
+API_SHOWTIME_URLS = [
+    # ✅ Nouvel endpoint événement IMAX 70mm
+    f"https://www.pathe.fr/api/event/{EVENT_SLUG}/showtimes/{CINEMA_SLUG}",
+    f"https://www.pathe.fr/api/events/{EVENT_SLUG}/showtimes/{CINEMA_SLUG}",
+    f"https://www.pathe.fr/api/event/{EVENT_ID}/showtimes/{CINEMA_SLUG}",
+    # Fallback film standard (filtre IMAX 70 ensuite)
+    f"https://www.pathe.fr/api/show/{FILM_SLUG}/showtimes/{CINEMA_SLUG}",
+    f"https://www.pathe.fr/api/show/{FILM_ID}/showtimes/{CINEMA_SLUG}",
+    # Fallback programme cinéma entier
+    f"https://www.pathe.fr/api/cinema/{CINEMA_SLUG}/shows",
+    f"https://www.pathe.fr/api/cinemas/{CINEMA_SLUG}/showtimes",
+]
+
+# Pages HTML de secours
+HTML_URLS = [
+    f"https://www.pathe.fr/evenements/{EVENT_SLUG}",
+    f"https://www.pathe.fr/cinemas/{CINEMA_SLUG}",
+    f"https://www.pathe.fr/films/{FILM_SLUG}?cinema={CINEMA_SLUG}",
+]
+
+BOOKING_URL = f"https://www.pathe.fr/evenements/{EVENT_SLUG}"
+
+IMAX_70_KEYWORDS = (
+    "imax 70",
+    "70mm",
+    "70 mm",
+    "imax® 70",
+    "projection imax 70",
+    "argentique",
 )
 
-# Fichier d'état (persiste entre les runs)
 STATE_FILE = Path(os.getenv("STATE_FILE", Path(__file__).parent / "state.json"))
-
-# Intervalle mini entre deux notifs identiques (anti-spam), en secondes
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "1800"))  # 30 min
-
-# Anti-spam pour les alertes d'erreur / rate-limit
-ERROR_COOLDOWN_SECONDS = int(os.getenv("ERROR_COOLDOWN_SECONDS", "3600"))  # 1 h
-
-# Intervalle entre deux checks en mode --loop (Docker)
-CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "300"))  # 5 min
+COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "1800"))
 
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -66,21 +87,10 @@ session.headers.update(
         "User-Agent": USER_AGENT,
         "Accept": "application/json, text/html, */*",
         "Accept-Language": "fr-FR,fr;q=0.9",
-        "Referer": "https://www.pathe.fr/",
+        "Origin": "https://www.pathe.fr",
+        "Referer": f"https://www.pathe.fr/evenements/{EVENT_SLUG}",
     }
 )
-
-
-class RateLimitError(Exception):
-    """HTTP 429 / rate-limit Pathé ou ntfy."""
-
-    def __init__(self, message: str, *, retry_after: int | None = None):
-        super().__init__(message)
-        self.retry_after = retry_after
-
-
-class ApiError(Exception):
-    """Erreur API Pathé non récupérable pour ce cycle."""
 
 
 # ──────────────────────────────────────────────
@@ -94,16 +104,15 @@ def load_state() -> dict[str, Any]:
             log.warning("state.json corrompu, reset")
     return {
         "known_show_ids": [],
+        "known_dates": [],
         "last_notify_hash": None,
         "last_notify_at": None,
-        "last_error_hash": None,
-        "last_error_at": None,
         "last_check_at": None,
+        "last_api_url": None,
     }
 
 
 def save_state(state: dict[str, Any]) -> None:
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(
         json.dumps(state, indent=2, ensure_ascii=False),
         encoding="utf-8",
@@ -111,7 +120,7 @@ def save_state(state: dict[str, Any]) -> None:
 
 
 # ──────────────────────────────────────────────
-# Notification push iPhone (ntfy)
+# Push ntfy (iPhone)
 # ──────────────────────────────────────────────
 def send_push(
     title: str,
@@ -121,9 +130,8 @@ def send_push(
     click_url: str | None = None,
     tags: list[str] | None = None,
 ) -> bool:
-    """Envoie une notification push via ntfy.sh."""
     if "CHANGE_MOI" in NTFY_TOPIC:
-        log.error("Configure NTFY_TOPIC avant de lancer le script !")
+        log.error("Configure NTFY_TOPIC !")
         return False
 
     payload: dict[str, Any] = {
@@ -136,12 +144,7 @@ def send_push(
     if click_url:
         payload["click"] = click_url
         payload["actions"] = [
-            {
-                "action": "view",
-                "label": "Réserver",
-                "url": click_url,
-                "clear": True,
-            }
+            {"action": "view", "label": "Réserver", "url": click_url, "clear": True}
         ]
 
     try:
@@ -152,177 +155,278 @@ def send_push(
             timeout=15,
         )
         r.raise_for_status()
-        log.info("Push envoyée : %s", title)
+        log.info("Push OK : %s", title)
         return True
     except requests.RequestException as e:
-        log.error("Échec push ntfy : %s", e)
+        log.error("Push ntfy échouée : %s", e)
         return False
-
-
-def _cooldown_active(
-    state: dict,
-    *,
-    hash_key: str,
-    at_key: str,
-    msg_hash: str,
-    cooldown: int,
-) -> bool:
-    if state.get(hash_key) != msg_hash:
-        return False
-    last_at = state.get(at_key)
-    if not last_at:
-        return False
-    try:
-        delta = (datetime.now(timezone.utc) - datetime.fromisoformat(last_at)).total_seconds()
-    except ValueError:
-        return False
-    if delta < cooldown:
-        log.info("Cooldown actif (%.0fs restants), skip notif", cooldown - delta)
-        return True
-    return False
 
 
 def notify_if_new(state: dict, title: str, message: str, click_url: str) -> None:
-    """Anti-spam : n'envoie pas 2 fois le même message dans le cooldown."""
     msg_hash = hashlib.sha256(f"{title}|{message}".encode()).hexdigest()
-    if _cooldown_active(
-        state,
-        hash_key="last_notify_hash",
-        at_key="last_notify_at",
-        msg_hash=msg_hash,
-        cooldown=COOLDOWN_SECONDS,
-    ):
-        return
-
+    now = datetime.now(timezone.utc)
+    last_at = state.get("last_notify_at")
+    if state.get("last_notify_hash") == msg_hash and last_at:
+        try:
+            delta = (now - datetime.fromisoformat(last_at)).total_seconds()
+            if delta < COOLDOWN_SECONDS:
+                log.info("Cooldown (%.0fs), skip", COOLDOWN_SECONDS - delta)
+                return
+        except ValueError:
+            pass
     if send_push(title, message, click_url=click_url):
         state["last_notify_hash"] = msg_hash
-        state["last_notify_at"] = datetime.now(timezone.utc).isoformat()
-
-
-def notify_error(
-    state: dict,
-    title: str,
-    message: str,
-    *,
-    tags: list[str] | None = None,
-) -> None:
-    """Push d'erreur / rate-limit avec cooldown dédié (évite le spam)."""
-    msg_hash = hashlib.sha256(f"{title}|{message}".encode()).hexdigest()
-    if _cooldown_active(
-        state,
-        hash_key="last_error_hash",
-        at_key="last_error_at",
-        msg_hash=msg_hash,
-        cooldown=ERROR_COOLDOWN_SECONDS,
-    ):
-        return
-
-    if send_push(title, message, priority=4, tags=tags or ["warning", "rotating_light"]):
-        state["last_error_hash"] = msg_hash
-        state["last_error_at"] = datetime.now(timezone.utc).isoformat()
-        save_state(state)
+        state["last_notify_at"] = now.isoformat()
 
 
 # ──────────────────────────────────────────────
-# Récupération des séances
+# Parsing
 # ──────────────────────────────────────────────
-def parse_time(time_val: Any) -> str:
-    """'2026-08-11 13:30:00' / ISO → '13:30'."""
-    s = str(time_val).strip()
-    if "T" in s:
-        return s[11:16]
-    if " " in s and len(s) >= 16:
-        return s.split(" ", 1)[1][:5]
-    if re.fullmatch(r"\d{1,2}:\d{2}", s):
-        hh, mm = s.split(":")
-        return f"{int(hh):02d}:{mm}"
-    return s[:5]
+def is_imax_70(text: str) -> bool:
+    t = (text or "").lower()
+    return any(k in t for k in IMAX_70_KEYWORDS)
 
 
-def show_id_from(obj: dict[str, Any], date: str, hhmm: str) -> str:
-    ref = obj.get("refCmd") or obj.get("id") or obj.get("showtimeId") or ""
-    if ref:
-        # ex. https://s.pathe.fr/fr/V3335S214676/booking → V3335S214676
-        m = re.search(r"(V\d+S\d+)", str(ref))
-        return m.group(1) if m else str(ref)
-    return f"{date}-{hhmm}-{obj.get('version', '')}"
-
-
-def normalize_show(obj: dict[str, Any], date_hint: str | None = None) -> dict[str, Any] | None:
-    time_val = obj.get("time") or obj.get("startsAt") or obj.get("startTime")
-    if not time_val:
-        return None
-
-    hhmm = parse_time(time_val)
-    date = date_hint or str(time_val)[:10]
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
-        date = "?"
-
-    status = str(obj.get("status", "")).lower()
-    bookable = status in ("available", "almostfull", "fewseats", "")
-    if status in ("soldout", "cancelled", "canceled", "unavailable"):
-        bookable = False
-
-    version = str(obj.get("version") or "").upper()
-    if version == "VOST":
-        version = "VOSTFR"
-
-    booking = (
-        obj.get("refCmd")
-        or obj.get("bookingUrl")
-        or obj.get("url")
-        or BOOKING_URL
-    )
-
-    return {
-        "id": show_id_from(obj, date, hhmm),
-        "date": date,
-        "time": hhmm,
-        "label": "IMAX 70mm",
-        "version": version,
-        "bookable": bookable,
-        "seats": obj.get("seatsAvailable") or obj.get("availableSeats"),
-        "status": status or ("available" if bookable else "unknown"),
-        "url": booking,
-        "auditorium": obj.get("auditoriumName") or "IMAX",
-    }
-
-
-def parse_api_payload(data: Any, date_hint: str | None = None) -> list[dict[str, Any]]:
-    """
-    Parse Pathé showtimes :
-    - dict { 'YYYY-MM-DD': [show, ...] }
-    - list [show, ...] (endpoint /date)
-    """
+def parse_api_payload(data: Any, source_is_event: bool = False) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
 
-    if isinstance(data, list):
-        for item in data:
-            if isinstance(item, dict):
-                show = normalize_show(item, date_hint)
-                if show:
-                    results.append(show)
-        return dedupe_shows(results)
+    def walk(obj: Any, date_hint: str | None = None) -> None:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(k)):
+                    walk(v, date_hint=str(k))
+                else:
+                    time_val = (
+                        obj.get("time")
+                        or obj.get("startsAt")
+                        or obj.get("startTime")
+                        or obj.get("hour")
+                        or obj.get("start")
+                    )
+                    show_id = str(
+                        obj.get("id")
+                        or obj.get("showtimeId")
+                        or obj.get("ref")
+                        or obj.get("uuid")
+                        or ""
+                    )
+                    label_parts = []
+                    for f in (
+                        "experience",
+                        "format",
+                        "screenType",
+                        "screen",
+                        "version",
+                        "tags",
+                        "label",
+                        "title",
+                        "name",
+                        "diffusionVersion",
+                    ):
+                        val = obj.get(f)
+                        if isinstance(val, list):
+                            label_parts.extend(str(x) for x in val)
+                        elif val:
+                            label_parts.append(str(val))
+                    label = " ".join(label_parts)
 
-    if isinstance(data, dict):
-        # Endpoint calendrier complet
-        date_keys = [k for k in data if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(k))]
-        if date_keys:
-            for k in date_keys:
-                results.extend(parse_api_payload(data[k], date_hint=str(k)))
-            return dedupe_shows(results)
+                    bookable = obj.get(
+                        "isBookable",
+                        obj.get("bookable", obj.get("available", obj.get("isAvailable"))),
+                    )
+                    seats = (
+                        obj.get("seatsAvailable")
+                        or obj.get("availableSeats")
+                        or obj.get("freeSeats")
+                        or obj.get("remainingSeats")
+                    )
 
-        # Objet séance unique
-        show = normalize_show(data, date_hint)
-        if show:
-            results.append(show)
+                    if time_val and (show_id or date_hint):
+                        t = str(time_val)
+                        hhmm = t[11:16] if "T" in t else t[:5]
+                        results.append(
+                            {
+                                "id": show_id or f"{date_hint}-{hhmm}-{label}",
+                                "date": date_hint or str(obj.get("date", ""))[:10],
+                                "time": hhmm,
+                                "label": label.strip() or ("IMAX 70mm" if source_is_event else ""),
+                                "version": str(
+                                    obj.get("version")
+                                    or obj.get("language")
+                                    or obj.get("diffusionVersion")
+                                    or ""
+                                ),
+                                "bookable": bool(bookable) if bookable is not None else True,
+                                "seats": seats,
+                                "url": obj.get("bookingUrl")
+                                or obj.get("url")
+                                or BOOKING_URL,
+                            }
+                        )
+                        return
+                    walk(v, date_hint=date_hint)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item, date_hint=date_hint)
 
-    return dedupe_shows(results)
+    walk(data)
 
-
-def dedupe_shows(shows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: set[str] = set()
-    unique: list[dict[str, Any]] = []
+    unique = []
+    for s in results:
+        if s["id"] not in seen:
+            seen.add(s["id"])
+            unique.append(s)
+    return unique
+
+
+def filter_imax_70(shows: list[dict], source_is_event: bool) -> list[dict]:
+    """Si la source est l'événement 70mm, on garde tout. Sinon on filtre."""
+    if source_is_event:
+        # Marque le label si vide
+        for s in shows:
+            if not s.get("label"):
+                s["label"] = "IMAX 70mm"
+        return shows
+    return [
+        s
+        for s in shows
+        if is_imax_70(f"{s.get('label', '')} {s.get('version', '')}")
+    ]
+
+
+# ──────────────────────────────────────────────
+# Fetch
+# ──────────────────────────────────────────────
+def fetch_via_api() -> tuple[list[dict[str, Any]], str | None]:
+    for url in API_SHOWTIME_URLS:
+        try:
+            r = session.get(url, timeout=20)
+            log.info("API %s → %s", url, r.status_code)
+
+            if r.status_code != 200:
+                # Log le message d'erreur Pathé (ex: no movie allowed)
+                try:
+                    err = r.json()
+                    log.warning("  body: %s", err)
+                except Exception:
+                    log.warning("  body: %s", r.text[:200])
+                continue
+
+            ct = r.headers.get("content-type", "")
+            if "json" not in ct:
+                continue
+
+            data = r.json()
+            # Détecte "no movie allowed" même en 200
+            if isinstance(data, dict):
+                err = str(data.get("error", data.get("message", ""))).lower()
+                if "no movie" in err or "not allowed" in err:
+                    log.warning("  refusé: %s", data)
+                    continue
+
+            source_is_event = "/event" in url
+            parsed = parse_api_payload(data, source_is_event=source_is_event)
+            imax = filter_imax_70(parsed, source_is_event)
+
+            if imax:
+                log.info("API OK (%d séances IMAX 70) : %s", len(imax), url)
+                return imax, url
+
+            log.info("  JSON OK mais 0 séance IMAX 70 (brut=%d)", len(parsed))
+        except (requests.RequestException, ValueError) as e:
+            log.debug("API fail %s : %s", url, e)
+
+    return [], None
+
+
+def fetch_via_html() -> list[dict[str, Any]]:
+    shows: list[dict[str, Any]] = []
+
+    for url in HTML_URLS:
+        try:
+            r = session.get(url, timeout=25)
+            r.raise_for_status()
+        except requests.RequestException as e:
+            log.warning("HTML fail %s : %s", url, e)
+            continue
+
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        # __NEXT_DATA__ (Next.js)
+        next_data = soup.find("script", id="__NEXT_DATA__")
+        if next_data and next_data.string:
+            try:
+                payload = json.loads(next_data.string)
+                source_is_event = "evenement" in url
+                parsed = parse_api_payload(payload, source_is_event=source_is_event)
+                imax = filter_imax_70(parsed, source_is_event)
+                if imax:
+                    log.info("HTML+JSON OK : %s (%d)", url, len(imax))
+                    return imax
+            except json.JSONDecodeError:
+                pass
+
+        # Heuristique DOM
+        page_text = soup.get_text(" ", strip=True)
+        if not is_imax_70(page_text) and "evenement" not in url:
+            continue
+
+        date_re = re.compile(
+            r"(\d{4}-\d{2}-\d{2})"
+            r"|((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun|Lun|Mar|Mer|Jeu|Ven|Sam|Dim)\.?\s+\d{1,2}\s+\w+)",
+            re.I,
+        )
+        time_re = re.compile(
+            r"\b([01]?\d|2[0-3])[h:]([0-5]\d)\b"
+        )
+
+        for el in soup.find_all(
+            string=re.compile(r"70\s*mm|IMAX\s*70|Projection IMAX", re.I)
+        ):
+            parent = el.find_parent(["section", "div", "article", "li"]) or el.parent
+            if not parent:
+                continue
+            block = parent.get_text(" ", strip=True)
+            dates = date_re.findall(block)
+            times = time_re.findall(block)
+            if not times:
+                grand = parent.find_parent(["section", "div", "article"])
+                if grand:
+                    block = grand.get_text(" ", strip=True)
+                    dates = date_re.findall(block)
+                    times = time_re.findall(block)
+
+            date_str = None
+            if dates:
+                raw = dates[0]
+                date_str = raw[0] if raw[0] else raw[1]
+
+            for t in times:
+                hhmm = f"{int(t[0]):02d}:{t[1]}"
+                sid = f"html-{date_str or 'unk'}-{hhmm}"
+                shows.append(
+                    {
+                        "id": sid,
+                        "date": date_str or "?",
+                        "time": hhmm,
+                        "label": "IMAX 70mm",
+                        "version": "VOSTFR" if "vost" in block.lower() else "",
+                        "bookable": not any(
+                            w in block.lower()
+                            for w in ("complet", "épuisé", "sold out", "indisponible")
+                        ),
+                        "seats": None,
+                        "url": BOOKING_URL,
+                    }
+                )
+
+        if shows:
+            log.info("HTML DOM OK : %s (%d)", url, len(shows))
+            break
+
+    seen: set[str] = set()
+    unique = []
     for s in shows:
         if s["id"] not in seen:
             seen.add(s["id"])
@@ -330,116 +434,22 @@ def dedupe_shows(shows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return unique
 
 
-def _retry_after_seconds(response: requests.Response) -> int | None:
-    raw = response.headers.get("Retry-After")
-    if not raw:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        return None
-
-
-def fetch_via_api() -> list[dict[str, Any]]:
-    """Endpoint dédié IMAX 70mm — calendrier complet."""
-    urls = [
-        f"{SHOWTIMES_URL}?language=fr",
-        SHOWTIMES_URL,
-    ]
-    last_status: int | None = None
-    last_error: str | None = None
-
-    for url in urls:
-        try:
-            r = session.get(url, timeout=20)
-            last_status = r.status_code
-
-            if r.status_code == 429:
-                retry = _retry_after_seconds(r)
-                raise RateLimitError(
-                    f"Rate-limit Pathé (429) sur {url}"
-                    + (f" — Retry-After {retry}s" if retry else ""),
-                    retry_after=retry,
-                )
-
-            if r.status_code in (403, 503):
-                last_error = f"HTTP {r.status_code}"
-                log.warning("API %s → %s", url, r.status_code)
-                continue
-
-            if r.status_code != 200:
-                last_error = f"HTTP {r.status_code}"
-                log.warning("API %s → %s", url, r.status_code)
-                continue
-
-            if "json" not in r.headers.get("content-type", ""):
-                last_error = "réponse non-JSON"
-                continue
-
-            parsed = parse_api_payload(r.json())
-            if parsed:
-                bookable = sum(1 for s in parsed if s.get("bookable"))
-                log.info(
-                    "API OK : %d séances IMAX 70mm (%d dispo)",
-                    len(parsed),
-                    bookable,
-                )
-                return parsed
-            last_error = "JSON vide / non parsable"
-        except RateLimitError:
-            raise
-        except (requests.RequestException, ValueError) as e:
-            last_error = str(e)
-            log.warning("API fail %s : %s", url, e)
-
-    if last_status in (403, 503) or last_error:
-        raise ApiError(
-            f"Impossible de récupérer les séances Pathé"
-            f" (dernier statut={last_status}, détail={last_error})"
-        )
-    return []
-
-
-def fetch_showtimes() -> list[dict[str, Any]]:
-    return fetch_via_api()
+def fetch_showtimes() -> tuple[list[dict[str, Any]], str | None]:
+    shows, api_url = fetch_via_api()
+    if shows:
+        return shows, api_url
+    log.info("API vide → fallback HTML")
+    return fetch_via_html(), None
 
 
 # ──────────────────────────────────────────────
-# Logique principale
+# Main logic
 # ──────────────────────────────────────────────
 def format_show(s: dict[str, Any]) -> str:
     seats = f" ({s['seats']} places)" if s.get("seats") is not None else ""
     status = "✅" if s.get("bookable", True) else "❌ complet"
     ver = f" {s['version']}" if s.get("version") else ""
-    return f"• {s['date']} {s['time']}{ver} — {s['label']}{seats} {status}"
-
-
-def handle_check_failure(state: dict, exc: BaseException) -> None:
-    if isinstance(exc, RateLimitError):
-        retry = f"\nRetry-After : {exc.retry_after}s" if exc.retry_after else ""
-        notify_error(
-            state,
-            "⚠️ Rate-limit Pathé",
-            f"{exc}{retry}\nLe watcher réessaiera au prochain cycle.",
-            tags=["hourglass", "warning"],
-        )
-        return
-
-    if isinstance(exc, ApiError):
-        notify_error(
-            state,
-            "⚠️ Erreur API Pathé",
-            str(exc),
-            tags=["warning"],
-        )
-        return
-
-    notify_error(
-        state,
-        "🚨 Erreur watcher IMAX",
-        f"{type(exc).__name__}: {exc}",
-        tags=["rotating_light", "x"],
-    )
+    return f"• {s['date']} {s['time']}{ver} — {s.get('label') or 'IMAX 70mm'}{seats} {status}"
 
 
 def run_check(*, force_notify: bool = False) -> int:
@@ -447,122 +457,12 @@ def run_check(*, force_notify: bool = False) -> int:
     state["last_check_at"] = datetime.now(timezone.utc).isoformat()
 
     log.info("Check IMAX 70mm Odysseum…")
-    try:
-        shows = fetch_showtimes()
-    except (RateLimitError, ApiError) as e:
-        log.error("%s", e)
-        handle_check_failure(state, e)
-        save_state(state)
-        return 1
+    shows, api_url = fetch_showtimes()
+    if api_url:
+        state["last_api_url"] = api_url
 
     if not shows:
-        log.warning("Aucune séance IMAX 70mm trouvée (API vide ou changée)")
-        notify_error(
-            state,
-            "⚠️ Aucune séance IMAX 70mm",
-            "L'API a répondu sans séance. Le show Pathé a peut-être changé de slug.",
-            tags=["warning"],
-        )
+        log.warning("Aucune séance IMAX 70mm trouvée")
         if force_notify:
             send_push(
-                "IMAX watcher — aucune séance",
-                "Le script n'a trouvé aucune séance IMAX 70mm.",
-                priority=3,
-                tags=["warning"],
-            )
-        save_state(state)
-        return 1
-
-    known_ids = set(state.get("known_show_ids") or [])
-    current_ids = {s["id"] for s in shows}
-    new_shows = sorted(
-        (s for s in shows if s["id"] not in known_ids),
-        key=lambda s: (s.get("date") or "", s.get("time") or ""),
-    )
-
-    log.info(
-        "%d séances IMAX 70 | +%d nouvelles",
-        len(shows),
-        len(new_shows),
-    )
-
-    # Premier run : baseline silencieuse (pas de notif)
-    if not known_ids and not force_notify:
-        log.info("Premier run — baseline enregistrée (%d séances), silence", len(shows))
-        state["known_show_ids"] = sorted(current_ids)
-        save_state(state)
-        return 0
-
-    # Uniquement les séances qui viennent d'apparaître
-    if new_shows:
-        msg = f"{len(new_shows)} nouvelle(s) séance(s) :\n\n" + "\n".join(
-            format_show(s) for s in new_shows[:15]
-        )
-        if len(new_shows) > 15:
-            msg += f"\n… +{len(new_shows) - 15} autres"
-        notify_if_new(
-            state,
-            "🎟️ Nouvelle séance IMAX 70mm !",
-            msg,
-            BOOKING_URL,
-        )
-    elif force_notify:
-        bookable = [s for s in shows if s.get("bookable", True)]
-        msg = f"{len(bookable)} séance(s) bookable(s) :\n\n" + "\n".join(
-            format_show(s) for s in bookable[:15]
-        )
-        send_push("IMAX 70mm — état actuel", msg, click_url=BOOKING_URL, priority=3)
-    else:
-        log.info("Aucune nouvelle séance")
-
-    state["known_show_ids"] = sorted(known_ids | current_ids)
-    if len(state["known_show_ids"]) > 500:
-        state["known_show_ids"] = sorted(current_ids)
-
-    save_state(state)
-    return 0
-
-
-def run_loop() -> None:
-    log.info(
-        "Mode boucle — check toutes les %ds (topic=%s)",
-        CHECK_INTERVAL_SECONDS,
-        NTFY_TOPIC if "CHANGE_MOI" not in NTFY_TOPIC else "NON CONFIGURÉ",
-    )
-    while True:
-        try:
-            run_check()
-        except Exception as e:
-            log.exception("Erreur pendant le check — retry au prochain cycle")
-            try:
-                handle_check_failure(load_state(), e)
-            except Exception:
-                log.exception("Impossible d'envoyer la notif d'erreur")
-        time.sleep(CHECK_INTERVAL_SECONDS)
-
-
-def main() -> None:
-    force = "--notify" in sys.argv or "--init-notify" in sys.argv
-    test = "--test-push" in sys.argv
-    loop = "--loop" in sys.argv or os.getenv("LOOP", "").lower() in ("1", "true", "yes")
-
-    if test:
-        ok = send_push(
-            "Test IMAX watcher",
-            "Si tu lis ça sur ton iPhone, ntfy est bien configuré 👍",
-            priority=4,
-            tags=["white_check_mark"],
-            click_url=BOOKING_URL,
-        )
-        sys.exit(0 if ok else 1)
-
-    if loop:
-        run_loop()
-        return
-
-    code = run_check(force_notify=force)
-    sys.exit(code)
-
-
-if __name__ == "__main__":
-    main()
+                "IMAX watcher — 0 séan
