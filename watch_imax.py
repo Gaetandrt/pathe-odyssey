@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Surveillance IMAX 70mm - L'Odyssée @ Pathé Odysseum
+Surveillance IMAX 70mm - L'Odyssee @ Pathe Odysseum
 Push iPhone via ntfy.sh
 """
 
@@ -19,30 +20,27 @@ from typing import Any
 import requests
 from bs4 import BeautifulSoup
 
-# ──────────────────────────────────────────────
+# --------------------------------------------------
 # CONFIG
-# ──────────────────────────────────────────────
+# --------------------------------------------------
 NTFY_TOPIC = os.getenv("NTFY_TOPIC", "pathe-odysseum-imax-CHANGE_MOI")
 NTFY_SERVER = os.getenv("NTFY_SERVER", "https://ntfy.sh")
 
 CINEMA_SLUG = "cinema-pathe-odysseum"
 
-# Événement IMAX 70mm (correct) + film classique (fallback)
+# Evenement IMAX 70mm (correct) + film classique (fallback)
 EVENT_SLUG = "l-odyssee-projection-imax-70mm-54413"
 EVENT_ID = "54413"
 FILM_SLUG = "l-odyssee-43836"
 FILM_ID = "43836"
 
-# Endpoints API — ordre de priorité (event d'abord)
+# Endpoints API - ordre de priorite (event d'abord)
 API_SHOWTIME_URLS = [
-    # ✅ Nouvel endpoint événement IMAX 70mm
     f"https://www.pathe.fr/api/event/{EVENT_SLUG}/showtimes/{CINEMA_SLUG}",
     f"https://www.pathe.fr/api/events/{EVENT_SLUG}/showtimes/{CINEMA_SLUG}",
     f"https://www.pathe.fr/api/event/{EVENT_ID}/showtimes/{CINEMA_SLUG}",
-    # Fallback film standard (filtre IMAX 70 ensuite)
     f"https://www.pathe.fr/api/show/{FILM_SLUG}/showtimes/{CINEMA_SLUG}",
     f"https://www.pathe.fr/api/show/{FILM_ID}/showtimes/{CINEMA_SLUG}",
-    # Fallback programme cinéma entier
     f"https://www.pathe.fr/api/cinema/{CINEMA_SLUG}/shows",
     f"https://www.pathe.fr/api/cinemas/{CINEMA_SLUG}/showtimes",
 ]
@@ -60,7 +58,7 @@ IMAX_70_KEYWORDS = (
     "imax 70",
     "70mm",
     "70 mm",
-    "imax® 70",
+    "imax(r) 70",
     "projection imax 70",
     "argentique",
 )
@@ -93,9 +91,9 @@ session.headers.update(
 )
 
 
-# ──────────────────────────────────────────────
-# État
-# ──────────────────────────────────────────────
+# --------------------------------------------------
+# Etat
+# --------------------------------------------------
 def load_state() -> dict[str, Any]:
     if STATE_FILE.exists():
         try:
@@ -119,9 +117,9 @@ def save_state(state: dict[str, Any]) -> None:
     )
 
 
-# ──────────────────────────────────────────────
+# --------------------------------------------------
 # Push ntfy (iPhone)
-# ──────────────────────────────────────────────
+# --------------------------------------------------
 def send_push(
     title: str,
     message: str,
@@ -131,7 +129,7 @@ def send_push(
     tags: list[str] | None = None,
 ) -> bool:
     if "CHANGE_MOI" in NTFY_TOPIC:
-        log.error("Configure NTFY_TOPIC !")
+        log.error("Configure NTFY_TOPIC avant de lancer le script !")
         return False
 
     payload: dict[str, Any] = {
@@ -144,7 +142,7 @@ def send_push(
     if click_url:
         payload["click"] = click_url
         payload["actions"] = [
-            {"action": "view", "label": "Réserver", "url": click_url, "clear": True}
+            {"action": "view", "label": "Reserver", "url": click_url, "clear": True}
         ]
 
     try:
@@ -158,7 +156,7 @@ def send_push(
         log.info("Push OK : %s", title)
         return True
     except requests.RequestException as e:
-        log.error("Push ntfy échouée : %s", e)
+        log.error("Push ntfy echouee : %s", e)
         return False
 
 
@@ -170,7 +168,7 @@ def notify_if_new(state: dict, title: str, message: str, click_url: str) -> None
         try:
             delta = (now - datetime.fromisoformat(last_at)).total_seconds()
             if delta < COOLDOWN_SECONDS:
-                log.info("Cooldown (%.0fs), skip", COOLDOWN_SECONDS - delta)
+                log.info("Cooldown (%.0fs restants), skip notif", COOLDOWN_SECONDS - delta)
                 return
         except ValueError:
             pass
@@ -179,9 +177,9 @@ def notify_if_new(state: dict, title: str, message: str, click_url: str) -> None
         state["last_notify_at"] = now.isoformat()
 
 
-# ──────────────────────────────────────────────
+# --------------------------------------------------
 # Parsing
-# ──────────────────────────────────────────────
+# --------------------------------------------------
 def is_imax_70(text: str) -> bool:
     t = (text or "").lower()
     return any(k in t for k in IMAX_70_KEYWORDS)
@@ -281,9 +279,8 @@ def parse_api_payload(data: Any, source_is_event: bool = False) -> list[dict[str
 
 
 def filter_imax_70(shows: list[dict], source_is_event: bool) -> list[dict]:
-    """Si la source est l'événement 70mm, on garde tout. Sinon on filtre."""
+    """Si la source est l'evenement 70mm, on garde tout. Sinon on filtre."""
     if source_is_event:
-        # Marque le label si vide
         for s in shows:
             if not s.get("label"):
                 s["label"] = "IMAX 70mm"
@@ -295,17 +292,16 @@ def filter_imax_70(shows: list[dict], source_is_event: bool) -> list[dict]:
     ]
 
 
-# ──────────────────────────────────────────────
+# --------------------------------------------------
 # Fetch
-# ──────────────────────────────────────────────
+# --------------------------------------------------
 def fetch_via_api() -> tuple[list[dict[str, Any]], str | None]:
     for url in API_SHOWTIME_URLS:
         try:
             r = session.get(url, timeout=20)
-            log.info("API %s → %s", url, r.status_code)
+            log.info("API %s -> %s", url, r.status_code)
 
             if r.status_code != 200:
-                # Log le message d'erreur Pathé (ex: no movie allowed)
                 try:
                     err = r.json()
                     log.warning("  body: %s", err)
@@ -318,11 +314,10 @@ def fetch_via_api() -> tuple[list[dict[str, Any]], str | None]:
                 continue
 
             data = r.json()
-            # Détecte "no movie allowed" même en 200
             if isinstance(data, dict):
                 err = str(data.get("error", data.get("message", ""))).lower()
                 if "no movie" in err or "not allowed" in err:
-                    log.warning("  refusé: %s", data)
+                    log.warning("  refuse: %s", data)
                     continue
 
             source_is_event = "/event" in url
@@ -330,10 +325,10 @@ def fetch_via_api() -> tuple[list[dict[str, Any]], str | None]:
             imax = filter_imax_70(parsed, source_is_event)
 
             if imax:
-                log.info("API OK (%d séances IMAX 70) : %s", len(imax), url)
+                log.info("API OK (%d seances IMAX 70) : %s", len(imax), url)
                 return imax, url
 
-            log.info("  JSON OK mais 0 séance IMAX 70 (brut=%d)", len(parsed))
+            log.info("  JSON OK mais 0 seance IMAX 70 (brut=%d)", len(parsed))
         except (requests.RequestException, ValueError) as e:
             log.debug("API fail %s : %s", url, e)
 
@@ -353,7 +348,6 @@ def fetch_via_html() -> list[dict[str, Any]]:
 
         soup = BeautifulSoup(r.text, "html.parser")
 
-        # __NEXT_DATA__ (Next.js)
         next_data = soup.find("script", id="__NEXT_DATA__")
         if next_data and next_data.string:
             try:
@@ -367,7 +361,6 @@ def fetch_via_html() -> list[dict[str, Any]]:
             except json.JSONDecodeError:
                 pass
 
-        # Heuristique DOM
         page_text = soup.get_text(" ", strip=True)
         if not is_imax_70(page_text) and "evenement" not in url:
             continue
@@ -377,9 +370,7 @@ def fetch_via_html() -> list[dict[str, Any]]:
             r"|((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun|Lun|Mar|Mer|Jeu|Ven|Sam|Dim)\.?\s+\d{1,2}\s+\w+)",
             re.I,
         )
-        time_re = re.compile(
-            r"\b([01]?\d|2[0-3])[h:]([0-5]\d)\b"
-        )
+        time_re = re.compile(r"\b([01]?\d|2[0-3])[h:]([0-5]\d)\b")
 
         for el in soup.find_all(
             string=re.compile(r"70\s*mm|IMAX\s*70|Projection IMAX", re.I)
@@ -414,7 +405,7 @@ def fetch_via_html() -> list[dict[str, Any]]:
                         "version": "VOSTFR" if "vost" in block.lower() else "",
                         "bookable": not any(
                             w in block.lower()
-                            for w in ("complet", "épuisé", "sold out", "indisponible")
+                            for w in ("complet", "epuise", "sold out", "indisponible")
                         ),
                         "seats": None,
                         "url": BOOKING_URL,
@@ -438,31 +429,127 @@ def fetch_showtimes() -> tuple[list[dict[str, Any]], str | None]:
     shows, api_url = fetch_via_api()
     if shows:
         return shows, api_url
-    log.info("API vide → fallback HTML")
+    log.info("API vide -> fallback HTML")
     return fetch_via_html(), None
 
 
-# ──────────────────────────────────────────────
+# --------------------------------------------------
 # Main logic
-# ──────────────────────────────────────────────
+# --------------------------------------------------
 def format_show(s: dict[str, Any]) -> str:
     seats = f" ({s['seats']} places)" if s.get("seats") is not None else ""
-    status = "✅" if s.get("bookable", True) else "❌ complet"
+    status = "OK" if s.get("bookable", True) else "COMPLET"
     ver = f" {s['version']}" if s.get("version") else ""
-    return f"• {s['date']} {s['time']}{ver} — {s.get('label') or 'IMAX 70mm'}{seats} {status}"
+    return f"- {s['date']} {s['time']}{ver} : {s.get('label') or 'IMAX 70mm'}{seats} [{status}]"
 
 
 def run_check(*, force_notify: bool = False) -> int:
     state = load_state()
     state["last_check_at"] = datetime.now(timezone.utc).isoformat()
 
-    log.info("Check IMAX 70mm Odysseum…")
+    log.info("Check IMAX 70mm Odysseum...")
     shows, api_url = fetch_showtimes()
     if api_url:
         state["last_api_url"] = api_url
 
     if not shows:
-        log.warning("Aucune séance IMAX 70mm trouvée")
+        log.warning("Aucune seance IMAX 70mm trouvee")
         if force_notify:
             send_push(
-                "IMAX watcher — 0 séan
+                "IMAX watcher - 0 seance",
+                "Aucun endpoint n'a renvoye de seances. Verifie les URLs / le WAF.",
+                priority=3,
+                tags=["warning"],
+                click_url=BOOKING_URL,
+            )
+        save_state(state)
+        return 1
+
+    bookable = [s for s in shows if s.get("bookable", True)]
+    known_ids = set(state.get("known_show_ids") or [])
+    known_dates = set(state.get("known_dates") or [])
+
+    current_ids = {s["id"] for s in shows}
+    current_dates = {s["date"] for s in shows if s.get("date") and s["date"] != "?"}
+
+    new_shows = [s for s in shows if s["id"] not in known_ids]
+    new_bookable = [s for s in bookable if s["id"] not in known_ids]
+    new_dates = sorted(current_dates - known_dates)
+
+    log.info(
+        "%d IMAX 70 (%d bookables) | +%d new | +%d dates | api=%s",
+        len(shows),
+        len(bookable),
+        len(new_shows),
+        len(new_dates),
+        api_url or "html",
+    )
+
+    is_first_run = not known_ids and not force_notify
+    if is_first_run:
+        log.info("Premier run - baseline")
+        state["known_show_ids"] = sorted(current_ids)
+        state["known_dates"] = sorted(current_dates)
+        save_state(state)
+        send_push(
+            "Watcher IMAX 70mm actif",
+            f"Baseline : {len(shows)} seance(s) jusqu'au "
+            f"{max(current_dates) if current_dates else '?'}.\n"
+            f"API: {api_url or 'HTML fallback'}",
+            priority=3,
+            click_url=BOOKING_URL,
+            tags=["white_check_mark", "movie_camera"],
+        )
+        return 0
+
+    if new_dates:
+        lines = [format_show(s) for s in bookable if s["date"] in new_dates] or [
+            format_show(s) for s in shows if s["date"] in new_dates
+        ]
+        msg = f"Nouvelles dates : {', '.join(new_dates)}\n\n" + "\n".join(lines[:12])
+        notify_if_new(state, "Nouvelles dates IMAX 70mm !", msg, BOOKING_URL)
+    elif new_bookable:
+        msg = "Places dispo :\n\n" + "\n".join(format_show(s) for s in new_bookable[:12])
+        notify_if_new(state, "Places IMAX 70mm disponibles !", msg, BOOKING_URL)
+    elif force_notify:
+        msg = f"{len(bookable)} bookable(s):\n\n" + "\n".join(
+            format_show(s) for s in bookable[:15]
+        )
+        send_push("IMAX 70mm - etat", msg, click_url=BOOKING_URL, priority=3)
+
+    state["known_show_ids"] = sorted(known_ids | current_ids)
+    state["known_dates"] = sorted(known_dates | current_dates)
+    if len(state["known_show_ids"]) > 500:
+        state["known_show_ids"] = sorted(current_ids)
+
+    save_state(state)
+    return 0
+
+
+def main() -> None:
+    if "--test-push" in sys.argv:
+        ok = send_push(
+            "Test IMAX watcher",
+            "ntfy OK sur iPhone",
+            priority=4,
+            tags=["white_check_mark"],
+            click_url=BOOKING_URL,
+        )
+        sys.exit(0 if ok else 1)
+
+    if "--probe" in sys.argv:
+        for url in API_SHOWTIME_URLS:
+            try:
+                r = session.get(url, timeout=15)
+                snippet = r.text[:180].replace("\n", " ")
+                print(f"[{r.status_code}] {url}\n  -> {snippet}\n")
+            except Exception as e:
+                print(f"[ERR] {url}\n  -> {e}\n")
+        sys.exit(0)
+
+    force = "--notify" in sys.argv
+    sys.exit(run_check(force_notify=force))
+
+
+if __name__ == "__main__":
+    main()
